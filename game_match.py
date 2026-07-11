@@ -10,7 +10,7 @@ per player; the pipeline is invariant to that.
 Public API
 ----------
 load_game(data)          – validate & load a game from a JSON-derived dict
-compute_keys(game)       – compute V, Q, inflow, depth via one DAG pass
+compute_keys(game, ...)  – compute V, Q, inflow, depth via one DAG pass
 match_players(...)       – match players on scale-invariant structural features
 match_states(...)        – match states on value / inflow / depth similarity
 match_actions(...)       – match actions on Q-value similarity
@@ -18,6 +18,20 @@ build_f0(...)            – build the initial matching f0
 score(f, ...)            – evaluate a full matching
 local_search(...)        – simulated-annealing improvement of f0
 match(gameA, gameB)      – end-to-end entry point
+
+Intrinsic reward option
+-----------------------
+Pass ``use_intrinsic=True`` to ``compute_keys``, ``build_f0``, or ``match``
+to replace real terminal payoffs with a scale-invariant *individual power*
+metric.  For each non-terminal state s and player i the immediate reward is:
+
+    R_i(s) = Σ_{s''} max_{b_i ∈ A_i(s)} ( E_{b_{-i}~unif(A_{-i}(s))} P(s''|s,(b_i,b_{-i})) )²
+
+Intuitively: for each possible next state s'', player i picks the action that
+maximises the *squared mean* transition probability to s'' (mean taken over
+the other players' uniform mixture), then sums over all next states.
+Terminal states contribute 0 (no further influence).  The metric is
+invariant to payoff scaling, so c_hat converges to 1 on a pure relabelling.
 """
 
 from __future__ import annotations
@@ -148,21 +162,27 @@ def load_game(data: dict) -> dict:
 # 2.  Key computation  (one backward + one forward pass)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def compute_keys(game: dict) -> dict:
+def compute_keys(game: dict, use_intrinsic: bool = False) -> dict:
     """Compute V, Q, inflow, depth via a single backward + forward DAG pass.
 
     Reference policy: all active players other than the one whose Q we compute
     play **uniform-random** over their actions.
 
-    Terminal s:
+    Terminal s (use_intrinsic=False):
         V_i[s] = payoffs[s][i]
 
+    Terminal s (use_intrinsic=True):
+        V_i[s] = 0   (terminal states have no further influence)
+
     Non-terminal s, player i **active**:
-        Q_i[s][a_i] = mean_{-i joint actions} Σ_{s'} P(s'|s,(a_i,−i)) V_i[s']
+        Q_i[s][a_i] = imm_i(s) + mean_{-i joint actions} Σ_{s'} P(s'|s,(a_i,−i)) V_i[s']
         V_i[s]      = max_{a_i} Q_i[s][a_i]
 
     Non-terminal s, player i **not active**:
-        V_i[s] = mean_{all joint profiles} Σ_{s'} P(s'|s,profile) V_i[s']
+        V_i[s] = imm_i(s) + mean_{all joint profiles} Σ_{s'} P(s'|s,profile) V_i[s']
+
+    where imm_i(s) = R_i(s)  when use_intrinsic=True, else 0.
+    See ``_compute_intrinsic_reward`` for the definition of R_i(s).
 
     inflow[s'] = Σ_s  mean_{profiles at s} P(s'|s,profile)   (root inflow = 0)
     depth[s]   = length of longest path root → s
@@ -188,7 +208,8 @@ def compute_keys(game: dict) -> dict:
 
         if sd.get("terminal", False):
             for p in players:
-                V[s][p] = float(sd["payoffs"].get(p, 0.0))
+                # With intrinsic rewards terminal states contribute 0
+                V[s][p] = 0.0 if use_intrinsic else float(sd["payoffs"].get(p, 0.0))
             continue
 
         active = sorted(sd["actions"])
@@ -198,7 +219,15 @@ def compute_keys(game: dict) -> dict:
             for t in sd["transitions"]
         }
 
+        # Immediate intrinsic power reward at this state (0 when not used)
+        R_intr = (
+            _compute_intrinsic_reward(players, sd, lookup, active)
+            if use_intrinsic
+            else {p: 0.0 for p in players}
+        )
+
         for i in players:
+            imm = R_intr[i]   # 0.0 when use_intrinsic=False
             if i in sd["actions"]:
                 # ── Active player: compute Q values then V = max Q ────────────
                 others = [p for p in active if p != i]
@@ -217,11 +246,13 @@ def compute_keys(game: dict) -> dict:
                         q_sum += sum(
                             pr * V[s_next][i] for s_next, pr in t["next"].items()
                         )
-                    Q[s][i][a_i] = q_sum / len(combos)
+                    # imm is the same for every a_i, so argmax is unchanged
+                    Q[s][i][a_i] = imm + q_sum / len(combos)
                 V[s][i] = max(Q[s][i].values())
             else:
                 # ── Non-active player: average V over all joint profiles ───────
-                V[s][i] = sum(
+                # R_intr[i] = 0 for non-active players
+                V[s][i] = imm + sum(
                     sum(pr * V[s_next][i] for s_next, pr in t["next"].items())
                     for t in sd["transitions"]
                 ) / len(sd["transitions"])
@@ -253,7 +284,76 @@ def compute_keys(game: dict) -> dict:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 3.  Similarity helpers
+# 3.  Intrinsic power reward
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _compute_intrinsic_reward(
+    players: List[str],
+    sd: dict,
+    lookup: dict,
+    active: List[str],
+) -> Dict[str, float]:
+    """Compute the intrinsic power reward R_i(s) for one non-terminal state s.
+
+    For active player i:
+
+        R_i(s) = Σ_{s''} max_{b_i ∈ A_i(s)} ( E_{b_{-i}~unif(A_{-i}(s))} P(s''|s,(b_i,b_{-i})) )²
+
+    Concretely for each reachable next state s'' and each candidate action b_i:
+      1. Average P(s''|s,(b_i,b_{-i})) over all uniform combos of other players.
+      2. Square that average (square is OUTSIDE the expectation).
+      3. Take the max over b_i.
+    Then sum over all s''.
+
+    For non-active player i (no actions at s): R_i(s) = 0.
+
+    Parameters
+    ----------
+    players : list of all player names
+    sd      : state dict for s (non-terminal)
+    lookup  : profile-tuple → transition dict (pre-built by compute_keys)
+    active  : sorted list of active-player names at s
+    """
+    # Collect all reachable next-state names at this state
+    all_s_next: set = set()
+    for t in lookup.values():
+        all_s_next.update(t["next"])
+
+    R: Dict[str, float] = {}
+
+    for i in players:
+        if i not in sd["actions"]:
+            R[i] = 0.0
+            continue
+
+        others = [p for p in active if p != i]
+        other_act_lists = [sd["actions"][p] for p in others]
+        combos = list(cartesian_product(*other_act_lists)) if others else [()]
+        n_combos = len(combos)
+
+        r_val = 0.0
+        for s_next in all_s_next:
+            best_sq = 0.0
+            for a_i in sd["actions"][i]:
+                # Mean transition probability to s_next over uniform b_{-i}
+                mean_prob = 0.0
+                for combo in combos:
+                    prof = dict(zip(others, combo))
+                    prof[i] = a_i
+                    key = tuple(prof[p] for p in active)
+                    mean_prob += lookup[key]["next"].get(s_next, 0.0)
+                mean_prob /= n_combos
+                # Square is outside the expectation
+                best_sq = max(best_sq, mean_prob ** 2)
+            r_val += best_sq
+
+        R[i] = r_val
+
+    return R
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4.  Similarity helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _sim(x: np.ndarray, y: np.ndarray) -> float:
@@ -277,7 +377,7 @@ def _sim_scalar(a: float, b: float) -> float:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4.  Player matching
+# 5.  Player matching
 # ═════════════════════════════════════════════════════════════════════════════
 
 def match_players(
@@ -522,6 +622,7 @@ def build_f0(
     gameB: dict,
     tau: float = DEFAULT_TAU,
     weights: Optional[dict] = None,
+    use_intrinsic: bool = False,
 ) -> dict:
     """Build the initial matching f0 through the 4-step pipeline.
 
@@ -532,6 +633,11 @@ def build_f0(
     3. Alternate (match states ↔ refine c_hat) × 3 iterations.
     4. Match actions from the stabilised state map.
 
+    Parameters
+    ----------
+    use_intrinsic : if True, replace terminal payoffs with the intrinsic
+        per-player power reward (see ``compute_keys`` / module docstring).
+
     Returns a dict with keys:
       ``player_map``, ``state_map``, ``action_maps``, ``c_hat``,
       ``c_hat_spread``, ``_keysA``, ``_keysB``.
@@ -539,8 +645,8 @@ def build_f0(
     if weights is None:
         weights = DEFAULT_WEIGHTS
 
-    keysA = compute_keys(gameA)
-    keysB = compute_keys(gameB)
+    keysA = compute_keys(gameA, use_intrinsic=use_intrinsic)
+    keysB = compute_keys(gameB, use_intrinsic=use_intrinsic)
 
     # Step 2 — player matching
     player_map = match_players(gameA, keysA, gameB, keysB, tau)
@@ -847,16 +953,19 @@ def match(
     weights: Optional[dict] = None,
     sa_iters: int = DEFAULT_SA_ITERS,
     seed: Optional[int] = None,
+    use_intrinsic: bool = False,
 ) -> dict:
     """Compute an approximate correspondence between two acyclic stochastic games.
 
     Parameters
     ----------
-    gameA, gameB : validated game dicts (output of ``load_game``).
-    tau          : similarity threshold; pairs below this are left unmatched.
-    weights      : dict with keys ``v``, ``i``, ``d``, ``t``; see module docs.
-    sa_iters     : number of simulated-annealing iterations.
-    seed         : optional RNG seed for reproducibility.
+    gameA, gameB  : validated game dicts (output of ``load_game``).
+    tau           : similarity threshold; pairs below this are left unmatched.
+    weights       : dict with keys ``v``, ``i``, ``d``, ``t``; see module docs.
+    sa_iters      : number of simulated-annealing iterations.
+    seed          : optional RNG seed for reproducibility.
+    use_intrinsic : if True, use the intrinsic power reward instead of real
+        terminal payoffs (scale-invariant; c_hat → 1 on pure relabelling).
 
     Returns
     -------
@@ -871,7 +980,7 @@ def match(
     if weights is None:
         weights = DEFAULT_WEIGHTS
 
-    f0 = build_f0(gameA, gameB, tau, weights)
+    f0 = build_f0(gameA, gameB, tau, weights, use_intrinsic=use_intrinsic)
     keysA = f0["_keysA"]
     keysB = f0["_keysB"]
 
@@ -1047,3 +1156,16 @@ if __name__ == "__main__":
     print("\nTrue scales  :", {f"p{i+1}": v for i, v in enumerate(true_scales.values())})
     print("True state map:", {v: state_rename[v] for v in state_rename})
     print("True player map:", player_rename)
+
+    # ── Run again with intrinsic power rewards ────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Re-running with use_intrinsic=True (power metric, scale-free)")
+    print("=" * 60)
+    result_intr = match(gameA, gameB, tau=0.4, sa_iters=20_000,
+                        seed=42, use_intrinsic=True)
+    print("Player map   :", result_intr["player_map"])
+    print("State map    :", result_intr["state_map"])
+    print("c_hat        :", {k: f"{v:.4f}" for k, v in result_intr["c_hat"].items()})
+    print("c_hat_spread :", {k: f"{v:.4f}" for k, v in result_intr["c_hat_spread"].items()})
+    print("Score        :", f"{result_intr['score']:.4f}")
+    print("(c_hat ≈ 1.0 expected since intrinsic rewards are payoff-scale-free)")
