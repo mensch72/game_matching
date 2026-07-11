@@ -350,3 +350,139 @@ class TestIntrinsicSelfMatch:
         # Intrinsic rewards ignore payoff scales → c_hat should be ~1.0
         for p, c in self.result["c_hat"].items():
             assert abs(c - 1.0) < 0.05, f"c_hat[{p}]={c:.4f}, expected ≈1.0"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Asymmetric games: a state / action / transition edge missing on one side
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _asym_base_raw():
+    """A small 2-player DAG used as game A for the asymmetry tests.
+
+    s0 (p1) → s1 (p2) / s2 (p1); s1 and s2 both lead to terminals s3, s4.
+    s1's action U is stochastic (0.5/0.5 over s3/s4) so a transition edge can
+    be dropped while keeping the game valid.
+    """
+    return {
+        "players": ["p1", "p2"],
+        "root": "s0",
+        "states": {
+            "s0": {"terminal": False, "actions": {"p1": ["L", "R"]},
+                   "transitions": [
+                       {"profile": {"p1": "L"}, "next": {"s1": 1.0}},
+                       {"profile": {"p1": "R"}, "next": {"s2": 1.0}},
+                   ]},
+            "s1": {"terminal": False, "actions": {"p2": ["U", "V"]},
+                   "transitions": [
+                       {"profile": {"p2": "U"}, "next": {"s3": 0.5, "s4": 0.5}},
+                       {"profile": {"p2": "V"}, "next": {"s4": 1.0}},
+                   ]},
+            "s2": {"terminal": False, "actions": {"p1": ["A", "B"]},
+                   "transitions": [
+                       {"profile": {"p1": "A"}, "next": {"s3": 1.0}},
+                       {"profile": {"p1": "B"}, "next": {"s4": 1.0}},
+                   ]},
+            "s3": {"terminal": True, "payoffs": {"p1": 3.0, "p2": 1.0}},
+            "s4": {"terminal": True, "payoffs": {"p1": 1.0, "p2": 2.0}},
+        },
+    }
+
+
+_ASYM_STATE_RENAME = {"s0": "t0", "s1": "t1", "s2": "t2", "s3": "t3", "s4": "t4"}
+_ASYM_PLAYER_RENAME = {"p1": "q1", "p2": "q2"}
+_ASYM_ACTION_RENAME = {"L": "LL", "R": "RR", "U": "UU", "V": "VV", "A": "AA", "B": "BB"}
+
+
+def _asym_raw_b(true_scales=None):
+    """Faithful relabelled + rescaled copy of ``_asym_base_raw`` (game B)."""
+    if true_scales is None:
+        true_scales = {"p1": 2.0, "p2": 0.5}
+    return gm._relabel_and_rescale(
+        _asym_base_raw(), _ASYM_STATE_RENAME, _ASYM_PLAYER_RENAME,
+        _ASYM_ACTION_RENAME, true_scales,
+    )
+
+
+class TestMissingElements:
+    """Show what happens when a state / action / transition edge is missing on
+    one side.  In every case the pipeline must run, keep the state map
+    injective, and anchor the two roots together."""
+
+    def test_symmetric_reference_maps_everything(self):
+        # Baseline: with nothing missing the full correspondence is recovered.
+        gA = gm.load_game(_asym_base_raw())
+        gB = gm.load_game(_asym_raw_b())
+        res = gm.match(gA, gB, tau=0.4, sa_iters=5_000, seed=42)
+        for sA, sB in _ASYM_STATE_RENAME.items():
+            assert res["state_map"].get(sA) == sB
+        assert res["action_maps"][("s2", "p1")] == {"A": "AA", "B": "BB"}
+
+    def test_missing_state_leaves_extra_a_state_unmatched(self):
+        import copy
+        gA = gm.load_game(_asym_base_raw())
+
+        # Drop terminal t4 from B and reroute every edge that pointed at it to t3.
+        raw_b = copy.deepcopy(_asym_raw_b())
+        del raw_b["states"]["t4"]
+        for sd in raw_b["states"].values():
+            if sd.get("terminal"):
+                continue
+            for t in sd["transitions"]:
+                if "t4" in t["next"]:
+                    t["next"]["t3"] = t["next"].get("t3", 0.0) + t["next"].pop("t4")
+        gB = gm.load_game(raw_b)
+
+        res = gm.match(gA, gB, tau=0.4, sa_iters=5_000, seed=42)
+        sm = res["state_map"]
+
+        # Roots stay anchored; map stays injective.
+        assert sm["s0"] == "t0"
+        assert len(set(sm.values())) == len(sm)
+        # B has one fewer state, so at most |B| pairs and at least one A-state
+        # (a terminal) is left unmatched.
+        assert len(sm) <= len(gB["states"])
+        assert len(sm) < len(gA["states"])
+        unmatched_A = set(gA["states"]) - set(sm)
+        assert unmatched_A, "expected at least one A-state with no B counterpart"
+
+    def test_missing_action_leaves_extra_a_action_unmatched(self):
+        import copy
+        gA = gm.load_game(_asym_base_raw())
+
+        # B's t2 offers only one action (AA); the BB branch is gone.
+        raw_b = copy.deepcopy(_asym_raw_b())
+        raw_b["states"]["t2"]["actions"] = {"q1": ["AA"]}
+        raw_b["states"]["t2"]["transitions"] = [
+            {"profile": {"q1": "AA"}, "next": {"t3": 1.0}},
+        ]
+        gB = gm.load_game(raw_b)
+
+        res = gm.match(gA, gB, tau=0.4, sa_iters=5_000, seed=42)
+
+        # The two states still correspond, but only one action can be matched
+        # there (B has no second action), leaving A's other action unmatched.
+        assert res["state_map"].get("s2") == "t2"
+        amap = res["action_maps"].get(("s2", "p1"), {})
+        assert len(amap) == 1
+        assert set(amap).issubset({"A", "B"})
+
+    def test_missing_transition_edge_lowers_score(self):
+        import copy
+        gA = gm.load_game(_asym_base_raw())
+
+        # Symmetric reference score.
+        gB_full = gm.load_game(_asym_raw_b())
+        sym = gm.match(gA, gB_full, tau=0.4, sa_iters=5_000, seed=42)
+
+        # In B, t1's action UU now leads deterministically to t3 — the edge to
+        # t4 is missing, so this profile's next-state distribution differs.
+        raw_b = copy.deepcopy(_asym_raw_b())
+        raw_b["states"]["t1"]["transitions"][0]["next"] = {"t3": 1.0}
+        gB = gm.load_game(raw_b)
+
+        res = gm.match(gA, gB, tau=0.4, sa_iters=5_000, seed=42)
+
+        # Still runs and anchors the roots; the missing edge shows up as a
+        # strictly lower matching score than the symmetric reference.
+        assert res["state_map"]["s0"] == "t0"
+        assert res["score"] < sym["score"]
