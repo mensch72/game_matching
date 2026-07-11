@@ -12,7 +12,7 @@ Public API
 load_game(data)          – validate & load a game from a JSON-derived dict
 compute_keys(game, ...)  – compute V, Q, inflow, depth via one DAG pass
 match_players(...)       – match players on scale-invariant structural features
-match_states(...)        – match states on value / inflow / depth similarity
+match_states(...)        – match states within successors of matched states
 match_actions(...)       – match actions on Q-value similarity
 build_f0(...)            – build the initial matching f0
 score(f, ...)            – evaluate a full matching
@@ -494,6 +494,41 @@ def _refine_c_hat(
 # 6.  State matching
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _reach_probs(game: dict) -> Dict[str, float]:
+    """Probability of visiting each state from the root under uniform policies.
+
+    All active players play uniform-random, and each joint profile is weighted
+    equally (as elsewhere in this module).  For a DAG this is a single forward
+    pass in topological order:
+
+        reach[root]   = 1
+        reach[s_next] += reach[s] · mean_{profiles at s} P(s_next | s, profile)
+
+    Used only to *order* processing of states in ``match_states`` so that
+    more-likely-reached parents claim shared successors first.
+    """
+    G: nx.DiGraph = game["_graph"]
+    root: str = game["root"]
+    states: dict = game["states"]
+
+    reachable = nx.descendants(G, root) | {root}
+    sub = G.subgraph(reachable)
+    topo = list(nx.topological_sort(sub))
+
+    reach: Dict[str, float] = {s: 0.0 for s in topo}
+    reach[root] = 1.0
+    for s in topo:
+        sd = states[s]
+        if sd.get("terminal", False):
+            continue
+        n_prof = len(sd["transitions"])
+        for t in sd["transitions"]:
+            for s_next, pr in t["next"].items():
+                if s_next in reach:
+                    reach[s_next] += reach[s] * pr / n_prof
+    return reach
+
+
 def match_states(
     gameA: dict,
     keysA: dict,
@@ -504,14 +539,33 @@ def match_states(
     tau: float = DEFAULT_TAU,
     weights: Optional[dict] = None,
 ) -> dict:
-    """Match states via value / inflow / depth similarity (Hungarian).
+    """Match states graph-aware: only within successors of an already matched state.
 
-    sim_val   = sim( [V^A_i[s]]_i ,  [V^B_{π(i)}[s']/c_hat_i]_i )
-    sim_inf   = 1 − |inflow_A[s]/max_A − inflow_B[s']/max_B|
-    sim_depth = 1 − |depth_A[s]/max_A − depth_B[s']/max_B|
-    sim_state = w_v·sim_val + w_i·sim_inf + w_d·sim_depth
+    Rather than a single global assignment over all state pairs (which can pair
+    states in unrelated regions of the two DAGs), matching follows the
+    transition graph:
 
-    Returns ``{stateA: stateB}`` for pairs with sim_state ≥ ``tau``.
+    * The two roots are matched to each other as the anchor.
+    * A-states are processed in a topological order that **prefers states
+      reached more likely under uniform policies** (see ``_reach_probs``).
+    * When a matched state ``s → s'`` is processed, its still-unmatched
+      successors in A are matched (Hungarian) against the still-unused
+      successors of ``s'`` in B.
+
+    Because states are processed parents-before-children in reach-preferred
+    order and only unmatched successors are considered, a successor shared by
+    several parents (DAGs need not be trees) is claimed by the first parent that
+    reaches it — the more-likely-reached one.
+
+    Per-pair similarity is unchanged:
+
+        sim_val   = sim( [V^A_i[s]]_i ,  [V^B_{π(i)}[s']/c_hat_i]_i )
+        sim_inf   = 1 − |inflow_A[s]/max_A − inflow_B[s']/max_B|
+        sim_depth = 1 − |depth_A[s]/max_A − depth_B[s']/max_B|
+        sim_state = w_v·sim_val + w_i·sim_inf + w_d·sim_depth
+
+    Returns ``{stateA: stateB}`` for pairs with sim_state ≥ ``tau`` (the root
+    pair is always included as the anchor).
     """
     if weights is None:
         weights = DEFAULT_WEIGHTS
@@ -530,27 +584,56 @@ def match_states(
 
     mp = list(player_map.items())   # [(pA, pB), …]
 
-    stA = list(gameA["states"])
-    stB = list(gameB["states"])
-    n, m = len(stA), len(stB)
-
-    sim_mat = np.zeros((n, m))
-    for i, sA in enumerate(stA):
+    def _pair_sim(sA: str, sB: str) -> float:
         vA = np.array([VA[sA][pA] for pA, _ in mp]) if mp else np.zeros(0)
-        for j, sB in enumerate(stB):
-            vB = (
-                np.array([VB[sB][pB] / c_hat.get(pA, 1.0) for pA, pB in mp])
-                if mp
-                else np.zeros(0)
-            )
-            # Value similarity (0.5 if no players matched → neutral)
-            sv = _sim(vA, vB) if mp else 0.5
-            si = 1.0 - abs(inA[sA] / maxA_inf - inB[sB] / maxB_inf)
-            sd_ = 1.0 - abs(dA[sA] / maxA_d - dB[sB] / maxB_d)
-            sim_mat[i, j] = w_v * sv + w_i * si + w_d * sd_
+        vB = (
+            np.array([VB[sB][pB] / c_hat.get(pA, 1.0) for pA, pB in mp])
+            if mp
+            else np.zeros(0)
+        )
+        # Value similarity (0.5 if no players matched → neutral)
+        sv = _sim(vA, vB) if mp else 0.5
+        si = 1.0 - abs(inA[sA] / maxA_inf - inB[sB] / maxB_inf)
+        sd_ = 1.0 - abs(dA[sA] / maxA_d - dB[sB] / maxB_d)
+        return w_v * sv + w_i * si + w_d * sd_
 
-    rows, cols = linear_sum_assignment(-sim_mat)
-    return {stA[r]: stB[c] for r, c in zip(rows, cols) if sim_mat[r, c] >= tau}
+    GA: nx.DiGraph = gameA["_graph"]
+    GB: nx.DiGraph = gameB["_graph"]
+    rootA, rootB = gameA["root"], gameB["root"]
+
+    # Reach-preferred topological order over A's reachable states
+    reachA = _reach_probs(gameA)
+    reachableA = nx.descendants(GA, rootA) | {rootA}
+    subA = GA.subgraph(reachableA)
+    order = list(
+        nx.lexicographical_topological_sort(
+            subA, key=lambda s: (-reachA.get(s, 0.0), s)
+        )
+    )
+
+    # Anchor: match the two roots to each other.
+    state_map: dict = {rootA: rootB}
+    used_B = {rootB}
+
+    for sA in order:
+        if sA not in state_map:
+            # Unreachable through matched parents; leave for local search.
+            continue
+        sB = state_map[sA]
+        succ_A = [c for c in GA.successors(sA) if c not in state_map]
+        succ_B = [c for c in GB.successors(sB) if c not in used_B]
+        if not succ_A or not succ_B:
+            continue
+
+        sim_mat = np.array([[_pair_sim(a, b) for b in succ_B] for a in succ_A])
+        rows, cols = linear_sum_assignment(-sim_mat)
+        for r, c in zip(rows, cols):
+            if sim_mat[r, c] >= tau:
+                a, b = succ_A[r], succ_B[c]
+                state_map[a] = b
+                used_B.add(b)
+
+    return state_map
 
 
 # ═════════════════════════════════════════════════════════════════════════════
