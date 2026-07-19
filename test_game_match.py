@@ -197,11 +197,14 @@ class TestIntrinsicReward:
         }
         return sd, lookup, active
 
-    def test_nonactive_player_power_is_zero(self):
-        # p1 is not active at s2
+    def test_nonactive_player_power(self):
+        # p1 is not active at s2: its single "passing" action still gets power
+        # from the profile-averaged transitions (p2 uniform over U, V, W):
+        #   s4: (0.8/3)^2 = 64/900, s5: (0.7/3)^2 = 49/900, s6: (1.5/3)^2 = 225/900
+        #   R_p1(s2) = 338/900 = 0.375555...
         sd, lookup, active = self._lookup_for("s2")
         R = gm._compute_intrinsic_reward(self.game["players"], sd, lookup, active)
-        assert R["p1"] == pytest.approx(0.0, abs=1e-12)
+        assert R["p1"] == pytest.approx(338.0 / 900.0, abs=1e-9)
 
     def test_s2_p2_power(self):
         # s2: only p2 active; transitions U→(s4:0.8,s5:0.2), V→(s5:0.5,s6:0.5), W→(s6:1.0)
@@ -233,10 +236,11 @@ class TestIntrinsicReward:
         keys_intr = gm.compute_keys(self.game, use_intrinsic=True)
         assert keys_intr["V"]["s2"]["p2"] >= 1.89 - 1e-9
 
-    def test_intrinsic_inactive_player_v_zero_when_no_future_power(self):
-        # p1 is not active at s2, has no active states downstream → V[s2][p1]=0
+    def test_intrinsic_inactive_player_v_reflects_passing_power(self):
+        # p1 is not active at s2; downstream states are terminal (V=0), so its
+        # value equals the passing-action power R_p1(s2) = 338/900.
         keys_intr = gm.compute_keys(self.game, use_intrinsic=True)
-        assert keys_intr["V"]["s2"]["p1"] == pytest.approx(0.0, abs=1e-9)
+        assert keys_intr["V"]["s2"]["p1"] == pytest.approx(338.0 / 900.0, abs=1e-9)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

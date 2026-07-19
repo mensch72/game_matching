@@ -251,7 +251,7 @@ def compute_keys(game: dict, use_intrinsic: bool = False) -> dict:
                 V[s][i] = max(Q[s][i].values())
             else:
                 # ── Non-active player: average V over all joint profiles ───────
-                # R_intr[i] = 0 for non-active players
+                # imm = R_intr[i] is the passing-action power for this player
                 V[s][i] = imm + sum(
                     sum(pr * V[s_next][i] for s_next, pr in t["next"].items())
                     for t in sd["transitions"]
@@ -305,7 +305,9 @@ def _compute_intrinsic_reward(
       3. Take the max over b_i.
     Then sum over all s''.
 
-    For non-active player i (no actions at s): R_i(s) = 0.
+    For non-active player i (no actions at s) the same formula is used with i's
+    only action being "passing": i has no influence on the profile, so the max
+    is over a single action and b_{-i} ranges over every active player's actions.
 
     Parameters
     ----------
@@ -322,11 +324,16 @@ def _compute_intrinsic_reward(
     R: Dict[str, float] = {}
 
     for i in players:
-        if i not in sd["actions"]:
-            R[i] = 0.0
-            continue
+        if i in sd["actions"]:
+            # Active player: choose among i's own actions.
+            others = [p for p in active if p != i]
+            i_actions: list = list(sd["actions"][i])
+        else:
+            # Non-active player: single "passing" action, no influence on the
+            # profile; b_{-i} ranges over all active players' actions.
+            others = list(active)
+            i_actions = [None]
 
-        others = [p for p in active if p != i]
         other_act_lists = [sd["actions"][p] for p in others]
         combos = list(cartesian_product(*other_act_lists)) if others else [()]
         n_combos = len(combos)
@@ -334,12 +341,13 @@ def _compute_intrinsic_reward(
         r_val = 0.0
         for s_next in all_s_next:
             best_sq = 0.0
-            for a_i in sd["actions"][i]:
+            for a_i in i_actions:
                 # Mean transition probability to s_next over uniform b_{-i}
                 mean_prob = 0.0
                 for combo in combos:
                     prof = dict(zip(others, combo))
-                    prof[i] = a_i
+                    if a_i is not None:
+                        prof[i] = a_i
                     key = tuple(prof[p] for p in active)
                     mean_prob += lookup[key]["next"].get(s_next, 0.0)
                 mean_prob /= n_combos
